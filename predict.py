@@ -58,7 +58,7 @@ def load_ckpt(path, device):
     _delete_param(cfg, 'conditioners.args.drop_desc_p')
 
     lm = get_lm_model(loaded['xp.cfg'])
-    lm.load_state_dict(loaded['model']) 
+    lm.load_state_dict(loaded['model'])
     lm.eval()
     lm.cfg = cfg
     compression_model = CompressionSolver.model_from_checkpoint(cfg.compression_model_checkpoint, device=device)
@@ -69,8 +69,8 @@ class Predictor(BasePredictor):
         """Load the model into memory to make running multiple predictions efficient"""
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.mbd = MultiBandDiffusion.get_mbd_musicgen()
-
+        # self.mbd = MultiBandDiffusion.get_mbd_musicgen()
+        weights = "https://replicate.delivery/pbxt/wEcoWHKeiXyLS6bKETzjKlYu0ecy7ztzlmtqkJwtTiKXIw5RA/trained_model.tar"
         if str(weights) == "weights":
             weights = None
 
@@ -160,10 +160,10 @@ class Predictor(BasePredictor):
             default=None,
             ge=0,
         ),
-        multi_band_diffusion: bool = Input(
-            description="If `True`, the EnCodec tokens will be decoded with MultiBand Diffusion. Only works with non-stereo models.",
-            default=False,
-        ),
+        # multi_band_diffusion: bool = Input(
+        #     description="If `True`, the EnCodec tokens will be decoded with MultiBand Diffusion. Only works with non-stereo models.",
+        #     default=False,
+        # ),
         normalization_strategy: str = Input(
             description="Strategy for normalizing audio.",
             default="loudness",
@@ -184,18 +184,22 @@ class Predictor(BasePredictor):
             description="Increases the influence of inputs on the output. Higher values produce lower-varience outputs that adhere more closely to inputs.",
             default=3,
         ),
-        output_format: str = Input(
-            description="Output format for generated audio.",
-            default="wav",
-            choices=["wav", "mp3"],
-        ),
+        # output_format: str = Input(
+        #     description="Output format for generated audio.",
+        #     default="wav",
+        #     choices=["wav", "mp3"],
+        # ),
         seed: int = Input(
             description="Seed for random number generator. If None or -1, a random seed will be used.",
             default=None,
         ),
-        replicate_weights: str = Input(
-            description="Replicate MusicGen weights to use. Leave blank to use the default weights.",
-            default=None,
+        # replicate_weights: str = Input(
+        #     description="Replicate MusicGen weights to use. Leave blank to use the default weights.",
+        #     default=None,
+        # ),
+        remove_drums: bool = Input(
+            description="If `True`, the generated music will have the drums removed.",
+            default=True,
         ),
     ) -> Path:
 
@@ -242,10 +246,10 @@ class Predictor(BasePredictor):
         # elif model_version == "finetuned":
         #     model = self.my_model
 
-        if replicate_weights:
-            self.model = load_ckpt(replicate_weights, self.device)
-            print("Fine-tuned model weights hot-swapped!")
-
+        # if replicate_weights:
+        #     self.model = load_ckpt(replicate_weights, self.device)
+        #     print("Fine-tuned model weights hot-swapped!")
+        multi_band_diffusion = False
         if multi_band_diffusion and int(self.model.lm.cfg.transformer_lm.n_q) == 8:
             raise ValueError("Multi-band Diffusion only works with non-stereo models.")
 
@@ -258,7 +262,7 @@ class Predictor(BasePredictor):
             temperature=temperature,
             cfg_coef=classifier_free_guidance,
         )
-        
+
         if not seed or seed == -1:
             seed = torch.seed() % 2 ** 32 - 1
             set_all_seeds(seed)
@@ -334,7 +338,7 @@ class Predictor(BasePredictor):
                             descriptions=[prompt],
                             progress=True,
                             return_tokens=True
-                        )           
+                        )
                 if multi_band_diffusion:
                     wav = self.mbd.tokens_to_wav(tokens)
                 wavs.append(wav.detach().cpu())
@@ -366,7 +370,7 @@ class Predictor(BasePredictor):
                 input_audio = input_audio[None] if input_audio.dim() == 2 else input_audio
 
                 continuation_start = 0 if not continuation_start else continuation_start
-                
+
                 if continuation_end is None or continuation_end == -1:
                     continuation_end = input_audio.shape[-1] / sr
 
@@ -420,7 +424,7 @@ class Predictor(BasePredictor):
                     wav = torch.concat([wav,wavs[i+1][...,:sub_duration*wav_sr]],dim=-1)
 
             wav = wav.cpu()
-        
+
         else:
         '''
         if not input_audio:
@@ -468,14 +472,16 @@ class Predictor(BasePredictor):
         if multi_band_diffusion:
             wav = self.mbd.tokens_to_wav(tokens)
 
+        if remove_drums:
+            drums, non_drums = self.separate_drums(wav[0], model.sample_rate)
         audio_write(
             "out",
-            wav[0].cpu(),
+            non_drums.cpu(),
             model.sample_rate,
             strategy=normalization_strategy,
         )
         wav_path = "out.wav"
-
+        output_format = "wav"
         if output_format == "mp3":
             mp3_path = "out.mp3"
             if Path(mp3_path).exists():
@@ -522,6 +528,17 @@ class Predictor(BasePredictor):
 
     #     return codes
 
+    def separate_drums(self, music_input, sr):
+        from demucs.audio import convert_audio
+        from demucs.apply import apply_model
+
+        wav = convert_audio(music_input, sr, self.model.lm.condition_provider.conditioners['self_wav'].demucs.samplerate, self.model.lm.condition_provider.conditioners['self_wav'].demucs.audio_channels)
+        stems = apply_model(self.model.lm.condition_provider.conditioners['self_wav'].demucs, wav, device=self.device)
+        background = stems[:, self.model.lm.condition_provider.conditioners['self_wav'].demucs.sources.index('vocals')] + stems[:, self.model.lm.condition_provider.conditioners['self_wav'].demucs.sources.index('other')] + stems[:, self.model.lm.condition_provider.conditioners['self_wav'].demucs.sources.index('bass')]
+        drums = stems[:, self.model.lm.condition_provider.conditioners['self_wav'].demucs.sources.index('drums')]
+        background = convert_audio(background, self.model.lm.condition_provider.conditioners['self_wav'].demucs.samplerate, self.model.sample_rate, 1)
+        drums = convert_audio(drums, self.model.lm.condition_provider.conditioners['self_wav'].demucs.samplerate, self.model.sample_rate, 1)
+        return drums, background
 
 # From https://gist.github.com/gatheluck/c57e2a40e3122028ceaecc3cb0d152ac
 def set_all_seeds(seed):
